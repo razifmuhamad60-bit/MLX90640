@@ -1,0 +1,498 @@
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <SD.h>
+#include <SPI.h>
+#include <Wire.h>
+
+#define SD_CS 5   // PIN SD CARD BENAR ESP32-2432S024R
+#define BUTTON_PIN 35   // Tombol eksternal di GPIO35
+
+#include "MLX90640_API.h"
+#include "MLX90640_I2C_Driver.h"
+
+#define EMMISIVITY 0.95
+#define INTERPOLATE false
+
+#define C_BLUE Display.color565(0,0,255)
+#define C_RED Display.color565(255,0,0)
+#define C_GREEN Display.color565(0,255,0)
+#define C_WHITE Display.color565(255,255,255)
+#define C_BLACK Display.color565(0,0,0)
+#define C_LTGREY Display.color565(200,200,200)
+#define C_DKGREY Display.color565(80,80,80)
+#define C_GREY Display.color565(127,127,127)
+#define min(a,b) ((a)<(b)?(a):(b))
+#define max(a,b) ((a)>(b)?(a):(b))
+
+const byte MLX90640_address = 0x33; //Default 7-bit unshifted address of the MLX90640
+#define TA_SHIFT 8 //Default shift for MLX90640 in open air
+paramsMLX90640 mlx90640;
+
+
+TFT_eSPI Display = TFT_eSPI();
+
+
+// Added for measure Temp
+boolean measure = true;
+float centerTemp;
+unsigned long tempTime = millis();
+unsigned long tempTime2 = 0;
+
+// start with some initial colors
+float minTemp = 20.0;
+float maxTemp = 40.0;
+
+
+// =======================
+// Variabel Tombol
+// =======================
+bool lastButtonState = LOW;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 200;
+
+// variables for interpolated colors
+byte red, green, blue;
+
+// variables for row/column interpolation
+float intPoint, val, a, b, c, d, ii;
+int x, y, i, j;
+
+
+// array for the 32 x 24 measured tempValues
+static float tempValues[32*24];
+
+// Output size
+#define O_WIDTH 224
+#define O_HEIGHT 168
+#define O_RATIO O_WIDTH/32
+
+float **interpolated = NULL;
+uint16_t *imageData = NULL;
+bool galleryMode = false;
+
+int row;
+float temp, temp2;
+
+void readTempValues();
+void interpolate();
+float lerp(float v0, float v1, float t);
+void drawPicture();
+uint16_t getColor(float val);
+void setTempScale();
+void setAbcd();
+void drawLegend();
+void drawMeasurement();
+void saveBMP();
+void drawCenterTempToBuffer(uint16_t *buffer);
+void showBMP(const char *filename);
+void showLastImage();
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Hello.");
+
+  // Connect thermal sensor.
+  Wire.begin();
+  Wire.setClock(400000); // Increase I2C clock speed to 400kHz
+  Wire.beginTransmission((uint8_t)MLX90640_address);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("MLX90640 not detected at default I2C address. Please check wiring.");
+  }
+  else {
+    Serial.println("MLX90640 online!");
+  }
+  // Get device parameters - We only have to do this once
+  int status;
+  uint16_t eeMLX90640[832];
+  status = MLX90640_DumpEE(MLX90640_address, eeMLX90640);
+  if (status != 0) Serial.println("Failed to load system parameters");
+  status = MLX90640_ExtractParameters(eeMLX90640, &mlx90640);
+  if (status != 0) Serial.println("Parameter extraction failed");
+  // Set refresh rate
+  MLX90640_SetRefreshRate(MLX90640_address, 0x05); // Set rate to 8Hz effective - Works at 800kHz
+  // Once EEPROM has been read at 400kHz we can increase
+  Wire.setClock(800000);
+
+  // Set up Display.
+  Display.init();
+  //Display.setRotation(3);
+  Display.fillScreen(C_BLACK);
+  // =========================
+  // SD CARD INIT
+  if (!SD.begin(SD_CS)) {
+  Serial.println("❌ SD Card tidak terdeteksi");
+  } else {
+  Serial.println("✅ SD Card terdeteksi");
+  } 
+
+  pinMode(BUTTON_PIN, INPUT);  // GPIO35 pakai resistor eksternal
+
+  // Prepare interpolated array
+  interpolated = (float **)malloc(O_HEIGHT * sizeof(float *));
+  for (int i=0; i<O_HEIGHT; i++) {
+    interpolated[i] = (float *)malloc(O_WIDTH * sizeof(float));
+  }
+
+  // Prepare imageData array
+  imageData = (uint16_t *)malloc(O_WIDTH * O_HEIGHT * sizeof(uint16_t));
+
+  // get the cutoff points for the color interpolation routines
+  // note this function called when the temp scale is changed
+  setAbcd();
+  drawLegend();
+}
+void loop() {
+
+  tempTime = millis();
+  
+  readTempValues();
+  setTempScale();
+  drawPicture();
+  drawMeasurement();
+
+  // ===============================
+  // TOMBOL ANTI TAHAN (GPIO35)
+  // ===============================
+  static unsigned long pressStart = 0;
+bool reading = digitalRead(BUTTON_PIN);
+
+if (reading == HIGH && pressStart == 0) {
+  pressStart = millis();
+}
+
+if (reading == LOW && pressStart > 0) {
+
+  unsigned long pressDuration = millis() - pressStart;
+
+  if (pressDuration < 1000) {
+    // Tekan cepat → Simpan
+    Serial.println("Simpan gambar");
+    saveBMP();
+  } else {
+    // Tekan lama → Gallery
+    Serial.println("Masuk Gallery");
+    galleryMode = !galleryMode;
+
+    if (galleryMode) {
+      showLastImage();
+    } else {
+      Display.fillScreen(TFT_BLACK);
+    }
+  }
+
+  pressStart = 0;
+}
+
+
+  // Simpan via Serial
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 's') {
+      saveBMP();
+    }
+  }
+
+
+
+  // Tekan 's' di Serial Monitor untuk simpan
+  if (Serial.available()) {
+  char c = Serial.read();
+  if (c == 's') {
+    saveBMP();
+    }
+  }
+}
+
+// Read pixel data from MLX90640.
+void readTempValues() {
+  for (byte x = 0 ; x < 2 ; x++) // Read both subpages
+  {
+    uint16_t mlx90640Frame[834];
+    int status = MLX90640_GetFrameData(MLX90640_address, mlx90640Frame);
+    if (status < 0)
+    {
+      Serial.print("GetFrame Error: ");
+      Serial.println(status);
+    }
+
+    float vdd = MLX90640_GetVdd(mlx90640Frame, &mlx90640);
+    float Ta = MLX90640_GetTa(mlx90640Frame, &mlx90640);
+
+    float tr = Ta - TA_SHIFT; //Reflected temperature based on the sensor ambient temperature
+
+    MLX90640_CalculateTo(mlx90640Frame, &mlx90640, EMMISIVITY, tr, tempValues);
+  }
+}
+
+// Apply the filter after the interpolation
+void interpolate() {
+  for (row=0; row<24; row++) {
+    for (x=0; x<O_WIDTH; x++) {
+      temp  = tempValues[(31 - (x/7)) + (row*32) + 1];
+      temp2 = tempValues[(31 - (x/7)) + (row*32)];
+      interpolated[row*7][x] = lerp(temp, temp2, x%7/7.0);
+    }
+  }
+  for (x=0; x<O_WIDTH; x++) {
+    for (y=0; y<O_HEIGHT; y++) {
+      temp  = interpolated[y-y%7][x];
+      temp2 = interpolated[min((y-y%7)+7, O_HEIGHT-7)][x];
+      interpolated[y][x] = lerp(temp, temp2, 1);//y%7/7.0);
+    }
+  }
+}
+
+// Linear interpolation
+float lerp(float v0, float v1, float t) {
+  return v0 + t * (v1 - v0);
+}
+
+void drawPicture() {
+  if (INTERPOLATE) {
+    interpolate();
+    for (y=0; y<O_HEIGHT; y++) {
+      for (x=0; x<O_WIDTH; x++) {
+        imageData[(y*O_WIDTH) + x] = getColor(interpolated[y][x]);
+      }
+    }
+    Display.pushImage(8, 8, O_WIDTH, O_HEIGHT, imageData);
+  }
+  else {
+    for (y=0; y<24; y++) {
+      for (x=0; x<32; x++) {
+        Display.fillRect(8 + x*7, 8 + y*7, 7, 7, getColor(tempValues[(31-x) + (y*32)]));
+      }
+    }
+  }
+}
+
+// Get color for temp value.
+uint16_t getColor(float val) {
+  /*
+    pass in value and figure out R G B
+    several published ways to do this I basically graphed R G B and developed simple linear equations
+    again a 5-6-5 color display will not need accurate temp to R G B color calculation
+
+    equations based on
+    http://web-tech.ga-usa.com/2012/05/creating-a-custom-hot-to-cold-temperature-color-gradient-for-use-with-rrdtool/index.html
+
+  */
+
+  red = constrain(255.0 / (c - b) * val - ((b * 255.0) / (c - b)), 0, 255);
+
+  if ((val > minTemp) & (val < a)) {
+    green = constrain(255.0 / (a - minTemp) * val - (255.0 * minTemp) / (a - minTemp), 0, 255);
+  }
+  else if ((val >= a) & (val <= c)) {
+    green = 255;
+  }
+  else if (val > c) {
+    green = constrain(255.0 / (c - d) * val - (d * 255.0) / (c - d), 0, 255);
+  }
+  else if ((val > d) | (val < a)) {
+    green = 0;
+  }
+
+  if (val <= b) {
+    blue = constrain(255.0 / (a - b) * val - (255.0 * b) / (a - b), 0, 255);
+  }
+  else if ((val > b) & (val <= d)) {
+    blue = 0;
+  }
+  else if (val > d) {
+    blue = constrain(240.0 / (maxTemp - d) * val - (d * 240.0) / (maxTemp - d), 0, 240);
+  }
+
+  // use the displays color mapping function to get 5-6-5 color palet (R=5 bits, G=6 bits, B-5 bits)
+  return Display.color565(red, green, blue);
+}
+
+void setTempScale() {
+  minTemp = 255;
+  maxTemp = 0;
+  for (i = 0; i < 768; i++) {
+    minTemp = min(minTemp, tempValues[i]);
+    maxTemp = max(maxTemp, tempValues[i]);
+  }
+  setAbcd();
+  drawLegend();
+}
+
+// Function to get the cutoff points in the temp vs RGB graph.
+void setAbcd() {
+  a = minTemp + (maxTemp - minTemp) * 0.2121;
+  b = minTemp + (maxTemp - minTemp) * 0.3182;
+  c = minTemp + (maxTemp - minTemp) * 0.4242;
+  d = minTemp + (maxTemp - minTemp) * 0.8182;
+}
+
+// Draw a legend.
+void drawLegend() {
+  float inc = (maxTemp - minTemp) / 224.0;
+  j = 0;
+  for (ii = minTemp; ii < maxTemp; ii += inc) {
+    Display.drawFastVLine(8+ + j++, 292, 20, getColor(ii));
+  }
+  Display.setTextFont(2);
+  Display.setTextSize(1);
+  Display.setCursor(8, 272);
+  Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  Display.print(String(minTemp).substring(0, 5));
+  Display.setCursor(192, 272);
+  Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  Display.print(String(maxTemp).substring(0, 5));
+  Display.setTextFont(1);
+}
+
+// Draw a circle + measured value.
+void drawMeasurement() {
+  // Mark center measurement
+  Display.drawCircle(120, 8+84, 3, TFT_WHITE);
+  // Measure and print center temperature
+  centerTemp = (tempValues[383 - 16] + tempValues[383 - 15] + tempValues[384 + 15] + tempValues[384 + 16]) / 4;
+  Display.setCursor(86, 214);
+  Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  Display.setTextFont(2);
+  Display.setTextSize(2);
+  Display.print(String(centerTemp, 2) + " °C");
+}
+
+void drawCenterTempToBuffer(uint16_t *buffer) {
+  String tempText = String(centerTemp, 2) + " C";
+  int textX = 70;
+  int textY = 140;
+  // Tampilkan ke layar dulu
+  Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  Display.setTextFont(2);
+  Display.setTextSize(2);
+  Display.setCursor(textX, textY);
+  Display.print(tempText);
+
+  // Ambil ulang semua pixel layar dan masukkan ke buffer
+  for (int y = 0; y < O_HEIGHT; y++) {
+    for (int x = 0; x < O_WIDTH; x++) {
+      buffer[y * O_WIDTH + x] = Display.readPixel(x + 8, y + 8);
+    }
+  }
+}
+
+void saveBMP() {
+  static int imgIndex = 0;
+  char filename[24];
+  sprintf(filename, "/thermal_%03d.bmp", imgIndex++);
+  File file = SD.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("❌ Gagal membuat file BMP");
+    return;
+  }
+  uint32_t fileSize = 54 + (O_WIDTH * O_HEIGHT * 2);
+  uint8_t header[54] = {
+    'B','M',
+    (uint8_t)fileSize,(uint8_t)(fileSize>>8),
+    (uint8_t)(fileSize>>16),(uint8_t)(fileSize>>24),
+    0,0,0,0,
+    54,0,0,0,
+    40,0,0,0,
+    (uint8_t)O_WIDTH,(uint8_t)(O_WIDTH>>8),0,0,
+    (uint8_t)O_HEIGHT,(uint8_t)(O_HEIGHT>>8),0,0,
+    1,0,16,0
+  };
+  file.write(header, 54);
+  // =============================
+// Buat gambar ke buffer
+// =============================
+for (int y = 0; y < O_HEIGHT; y++) {
+  for (int x = 0; x < O_WIDTH; x++) {
+    uint16_t color;
+    if (INTERPOLATE) {
+      color = imageData[y * O_WIDTH + x];
+    } else {
+      int sx = x / 7;
+      int sy = y / 7;
+      color = getColor(tempValues[(31 - sx) + sy * 32]);
+    }
+    imageData[y * O_WIDTH + x] = color;
+  }
+}
+// Tambahkan suhu ke gambar
+// =============================
+drawCenterTempToBuffer(imageData);
+// Tulis buffer ke file BMP
+// =============================
+for (int y = O_HEIGHT - 1; y >= 0; y--) {
+  for (int x = 0; x < O_WIDTH; x++) {
+
+    uint16_t color = imageData[y * O_WIDTH + x];
+
+    file.write(color & 0xFF);
+    file.write(color >> 8);
+  }
+}
+file.close();
+  Serial.println("✅ BMP berhasil disimpan");
+}
+
+
+  void showBMP(const char *filename) {
+
+  File bmpFile = SD.open(filename);
+  if (!bmpFile) {
+    Serial.println("Gagal buka file BMP");
+    return;
+  }
+
+  bmpFile.seek(54); // lewati header
+
+  Display.fillScreen(TFT_BLACK);
+
+  for (int y = O_HEIGHT - 1; y >= 0; y--) {
+    for (int x = 0; x < O_WIDTH; x++) {
+
+      uint8_t low = bmpFile.read();
+      uint8_t high = bmpFile.read();
+      uint16_t color = (high << 8) | low;
+
+      Display.drawPixel(x + 8, y + 8, color);
+    }
+  }
+
+  bmpFile.close();
+}
+
+void showLastImage() {
+
+  File root = SD.open("/");
+  File file;
+  String lastFile = "";
+  int highestIndex = -1;
+
+  while (true) {
+    file = root.openNextFile();
+    if (!file) break;
+
+    String name = file.name();
+    Serial.println(name);   // DEBUG tampilkan semua file
+
+    if (name.startsWith("thermal_") && name.endsWith(".bmp")) {
+
+      int index = name.substring(8, 11).toInt();
+
+      if (index > highestIndex) {
+        highestIndex = index;
+        lastFile = "/" + name;   // tambahkan "/" saat membuka
+      }
+    }
+
+    file.close();
+  }
+
+  if (lastFile != "") {
+    Serial.println("Menampilkan: " + lastFile);
+    showBMP(lastFile.c_str());
+  } else {
+    Serial.println("Tidak ada file BMP");
+  }
+}
+
+
